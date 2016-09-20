@@ -1,0 +1,144 @@
+import("filter.lib");
+import("oscillator.lib");
+import("math.lib");
+
+latchneg(c,x)= x * s : + ~ *(1-s) with { s = (c < c'); };
+
+tester(i) = hbargraph("tester %i",-100,100);
+test_numsymbol = 3;
+
+testsequence =_<: (tableloop(b1),tableloop(b2),tableloop(b3),tableloop(b4))
+  with{
+    b1 = waveform{0,1,0};
+    b2 = waveform{0,1,0};
+    b3 = waveform{0,1,1};
+    b4 = waveform{1,0,1};
+    tableloop(bit) =bit ,%(4)~+(1) :rdtable;
+
+  };
+
+
+gain_conpensation = hslider("gain_compensation",1,0,3,0.001);
+
+
+input = _;
+frequency = nentry("career freq",1000,0,20000,0.1);
+baudrate=nentry("symbol rate",100,0,20000,0.1);
+
+pllrate = hslider("pllrate",1,0.001,10,0.01);
+pllrate_training = hslider("pllrate_training",0.1,0.0001,10,0.01);
+
+PLL_rate = select2(isTraining,pllrate,pllrate_training);
+
+vel_c = 340;
+distance  = hslider("distance",0,0,5,0.01);
+
+blocksize = nentry("blocksize",512,0,4096,1);
+
+delay_time = (((distance,vel_c):/),((blocksize*2,SR):/)):+;
+
+initialphase =(frequency*delay_time):fmod(1):*(PI) ;
+
+pha(freq) = (((freq,lowpass(1,PLL_rate):-):lf_sawpos) , ((PI,2):*) ):*;
+sampleclock = (baudrate:lf_sawpos:*(2):-(1));
+careerclock = ((frequency:lf_sawpos),((PI,2):*) ):*;
+
+isTraining = button("training");
+dataInsert = button("dataInsert")<:(_,mem):(<);
+
+train_sequence =(sampleclock<:bus(4),(multinoise(4):par(i,4,>=(0.)) )):interleave(4,2):par(i,4,latch);
+
+step_size = hslider("stepsize",0,0,2,0.01);
+training_stepsize = hslider("training_stepsize",1,0,2,0.01);
+
+master_stepsize = select2(isTraining,step_size,training_stepsize);
+
+lms_taps = 16; //最終的に44100とか
+dfe_taps = 2;
+
+error = _;
+rolloff_order = 4;
+
+phasewrap = tan:atan;
+
+coeff = par(i,tap,weight(input,error));
+
+sinmod = (_,((sin,_):*:*(2):lowpass(rolloff_order,baudrate+10))):latchneg;
+sinmod2 = (_,((sin,_):*:*(2):(lowpass(rolloff_order,baudrate)<:(bus2)))):(latchneg,_);
+
+cosmod = (_,((cos,_):*:*(2):lowpass(rolloff_order,baudrate+10))):latchneg;
+cosmod2 = (_,((cos,_):*:*(2):(lowpass(rolloff_order,baudrate)<:(bus2)))):(latchneg,_);
+
+
+decide(x) = (_,x):(>);
+
+decision = _<:((abs:decide(2/3)),decide(0));
+
+//convert 0~1 to min~max
+
+bin2(minimum,maximum) = (_ ,((maximum,minimum):-)) : * +(minimum);
+
+decided_signal =(_,_,_,_):(bin2(1/3,1),bin2(-1,1),bin2(1/3,1),bin2(-1,1)):>(*,*);
+
+qamdem = (sampleclock,pha(frequency),input)<:(_,!,!,cosmod,sinmod):swap3;
+
+qamdem2 = (sampleclock,pha(frequency),input)<:(_,!,!,cosmod2,sinmod2)<:(!,_,_,_,_,_,!,!,!,!):(interleave(2,2),_);
+
+qamdecision = (decision,decision);
+qamerror = bus(4)<:(((atan2_zero,atan2_zero):-:phasewrap),(interleave(2,2):(-,-)))<:((lowpass(1,10)),_,_);
+
+qam = qamdem<:((qamdecision<:bus(8)),bus(2)):(bus(4),qamerror);
+
+fir_module(tap) =( (_:@(tap)) , _):*;
+
+//input,coeff1,coeff2 to input,coeff1,input,coeff2,
+make_input(taps) =bus(taps+1)<:par(i,taps,(selector(0,taps+1),selector(i+1,taps+1)));
+
+fir_par(taps) = make_input(taps):par(i,taps,fir_module(i)):>_;
+//input:error,input
+// weight = ((((((step_size,2):*) ,error) : *),input):*,_) : (/): (+~_) ;
+swap3 = (bus(3)<:((!,_,!),(!,!,_),(_,!,!)));
+swap2 = bus(2)<:((!,_),(_,!));
+
+weight = (master_stepsize,_,_,+(0.00001)):(_,*,_):(*,_):(/):(+~(_));
+
+lms_module(tap) = bus(3):((_:@(tap)<:bus(4)),@(tap),_):(bus(3),weight):(*,*)<:((!,_),(_,!));
+
+//input:error,input
+lms_filter(taps) = (_,_,_)<:((par(i,taps,lms_module(i)))):(bus((taps)*2):>(_,_));
+
+doubletap(i) = (@(i)<:bus2:(_,(mem<:bus3)):(_,*,_)),_;
+
+applyweight(i) = _,(swap3:weight):*;
+// applyweight(i) = _,(swap3:weight:hbargraph("coeff%i",-100,100)):*;
+
+lms_route(taps) = interleave(4,taps):(bus(taps),(par(i,taps,_):>_<:bus(taps)),bus(taps),bus(taps)):interleave(taps,4);
+
+lms_filter2(taps) = (swap2)<:par(i,taps,doubletap(i)):lms_route(taps):par(i,taps,applyweight(i)):>_;
+
+
+nlms_filter(taps) =lms_filter2(taps);
+
+dfe(taps)=lms_filter2(taps);
+
+// equalization=((_<:bus(2)),bus(2)):interleave(2,2):((dfe(dfe_taps)),(nlms_filter(lms_taps))):+;
+equalization=((_<:bus(2)),bus(2)):interleave(2,2):((dfe(dfe_taps)),(nlms_filter(lms_taps))):(!,_);
+//test filter through
+// lms_filter(taps) = (_,_):(!,_):(_);
+
+
+multiselect(n,start,end)=bus(n)<:par(i,end-start+1,selector(i+start,n));
+
+// switchTraining =bus(8): interleave(4,2):par(i,4,select2(isTraining));
+switchTraining = ((isTraining<:(bus4)),bus(8)):interleave(4,3):par(i,4,select2);
+switchData = ((dataInsert<:(bus4)),bus(8)):interleave(4,3):par(i,4,select2);
+
+demodulator(train1,train2,train3,train4)=((((bus(6)):(bus(4),qamdem):par(i,2,equalization)<:(((qamdecision,(train1,train2,train3,train4)):switchTraining),_,_))~( ((decided_signal<:bus(4) ),bus(2)):(_,_,(qamerror:swap3)) ):multiselect(6,0,3)));
+
+modulator= decided_signal<:( (( lowpass(rolloff_order,baudrate),lowpass(rolloff_order,baudrate), (careerclock<:(cos,sin)) ) : interleave(2,2) : (*,*)),bus2);
+modulator2= decided_signal<:( (( (lowpass(rolloff_order,baudrate),lowpass(rolloff_order,baudrate))<:bus4, (careerclock<:(cos,sin)) ) : bus2,interleave(2,2) : (bus2,*,*)),bus2);
+
+
+// test(x,y)=(x,y):*;
+
+boxs = checkbox("bit1"),checkbox("bit2"),checkbox("bit3"),checkbox("bit4");
